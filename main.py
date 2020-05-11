@@ -1,15 +1,24 @@
-import sqlite3
-from shodan import Shodan, APIError
-import pandas as pd
-from elasticsearch import Elasticsearch, ElasticsearchException, RequestsHttpConnection
 import argparse
-import pathlib
-import sys
-import bitmath
+import itertools
 import json
+import pathlib
+import re
+import sqlite3
+import sys
+import time
 from datetime import datetime
 
-from config import ELASTIC_API_KEY
+import bitmath
+import pandas as pd
+from elasticsearch import (Elasticsearch, ElasticsearchException,
+                           RequestsHttpConnection)
+from shodan import APIError, Shodan
+from tqdm.contrib.concurrent import process_map
+
+
+from config import SHODAN_API_KEY, INDEX_EXCLUSION_LIST_REGEXES
+
+
 
 def search(db_file, keyword, api_key):
     api = Shodan(api_key)
@@ -19,7 +28,6 @@ def search(db_file, keyword, api_key):
         query += ' ' + keyword
     count_results = api.count(query)
     print(f'Total results for keyword "{keyword}": {count_results["total"]}')
-    count = 0
 
     with sqlite3.connect(str(db_file)) as conn:
         cur = conn.cursor()
@@ -57,115 +65,120 @@ def search(db_file, keyword, api_key):
             cur.close()
 
 
+def _scrape_parallel(args):
+    results = []
+    try:
+        ip, port = args
+        print(f'Scraping {ip}:{port}')
+        es = Elasticsearch([{"host": ip, "port": port}])
+        indices = es.indices.stats('_all')['indices']
+        if not indices:
+            print(f'No indexes for IP {ip}')
+            return []
+        for idx, data in indices.items():
+            exclude_index = False
+            if any(map(lambda rx: re.search(rx, idx),
+                       INDEX_EXCLUSION_LIST_REGEXES)):
+                continue
+            uuid = data.get('uuid') or idx
+            docs_count = data['total']['docs']['count']
+            docs_deleted = data['total']['docs']['deleted']
+            store_size_bytes = data['total']['store']['size_in_bytes']
+            bm = bitmath.Byte(store_size_bytes)
+            store_size = bm.best_prefix(bitmath.SI).format('{value:.0f} {unit}')
+            results.append((
+                ip, port, idx, uuid, docs_count, docs_deleted,
+                store_size, store_size_bytes,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        print(f'Scraped {len(results)} indexes from IP {ip}:{port}')
+    except ElasticsearchException as e:
+        print(f'Exception connecting to IP {ip}:{port}: {e}')
+    return results
+
 def scrape(db_file):
-    #ip_addresses = [('47.111.183.77', 9200)]
     ip_addresses = []
     with sqlite3.connect(str(db_file)) as conn:
         cur = conn.cursor()
         try:
             ip_addresses = cur.execute('SELECT IP_ADDRESS, PORT FROM IP_SEARCH_RESULT').fetchall()
+    
+            indexes = process_map(_scrape_parallel, ip_addresses, max_workers=4)
+            flattened = list(itertools.chain(*indexes))
+            cur.executemany(
+                    'INSERT OR REPLACE INTO ES_INDEXES '
+                    '(IP_ADDRESS, PORT, "INDEX", UUID, DOCS_COUNT, DOCS_DELETED, STORE_SIZE, STORE_SIZE_BYTES, UPDATED_DATE) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    flattened)
+            conn.commit()
         finally:
             cur.close()
-    length = len(ip_addresses)
-    for idx, (ip, port) in enumerate(ip_addresses):
-        print(f'({idx}/{length}) Scraping {ip}:{port}')
-        try:
-            es = Elasticsearch([{"host": ip, "port": port}])
-            indices = es.indices.stats('_all')['indices']
-            if not indices:
-                print(f'No indexes for IP {ip}')
-                continue
-            results = []
-            for idx, data in indices.items():
-                uuid = data.get('uuid') or idx
-                docs_count = data['total']['docs']['count']
-                docs_deleted = data['total']['docs']['deleted']
-                store_size_bytes = data['total']['store']['size_in_bytes']
-                bm = bitmath.Byte(store_size_bytes)
-                store_size = bm.best_prefix(bitmath.SI).format('{value:.0f} {unit}')
-                results.append((
-                    ip, port, idx, uuid, docs_count, docs_deleted,
-                    store_size, store_size_bytes,
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-            with sqlite3.connect(str(db_file)) as conn:
-                cur = conn.cursor()
-                try:
-                    cur.executemany(
-                            'INSERT OR REPLACE INTO ES_INDEXES '
-                            '(IP_ADDRESS, PORT, "INDEX", UUID, DOCS_COUNT, DOCS_DELETED, STORE_SIZE, STORE_SIZE_BYTES, UPDATED_DATE) '
-                            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                            results)
-                    conn.commit()
-                finally:
-                    cur.close()
-            print(f'Scraped {len(results)} indexes from IP {ip}:{port}')
-
-        except ElasticsearchException as e:
-            print(f'Exception connecting to IP {ip}:{port}: {e}')
 
 
-
-
-
-def sample(db_file:pathlib.Path, dump: bool):
-    if dump:
-        with sqlite3.connect(str(db_file)) as conn:
-            cur = conn.cursor()
-            samples = cur.execute('SELECT "INDEX", IP_ADDRESS, PORT, '
-                                        'SAMPLE FROM ES_SAMPLES'
-                                        ).fetchall()
-            print('[', end='')
-            first = True
-            for index, ip, port, sample in samples:
-                data = {
-                    'host': ip,
-                    'port': port,
-                    'index': index,
-                    'data': json.loads(sample)
-                }
-                if not first:
-                    print(',')
-                else:
-                    first = False
-                print(json.dumps(data, indent=2), end='')
-            print(']')
-        return
-
-    ip_addresses = []
+def _sample_parallel(args):
+    uuid, ip, port, index, db_file, sample_count = args
     with sqlite3.connect(str(db_file)) as conn:
         cur = conn.cursor()
         try:
-            ip_addresses = cur.execute('SELECT UUID, IP_ADDRESS, PORT, "INDEX" FROM '
-                                       'ES_INDEXES WHERE DOCS_COUNT > 0 ORDER BY IP_ADDRESS, PORT').fetchall()
-                                       
-            print('[', end='')
-            first = True
-            length = len(ip_addresses)
-            last_ip = None
-            for idx, (uuid, ip, port, index) in enumerate(ip_addresses):
-                print(f'({idx}/{length}) Sampling data from {ip}:{port}, index {index}')
+            results = []
+            es = Elasticsearch([{"host": ip, "port": port}])
+            response = es.search(index=index, size=sample_count)
+            if not response.get('hits', {}).get('hits', {}):
+                return
+            for result in response['hits']['hits']:
+                date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                sample = json.dumps(result, indent=2)
+                idnum = result['_id']
+                results.append((idnum, uuid, ip, port,
+                                index, sample, date))
+            tries = 3
+            while tries > 0:
                 try:
-                    es = Elasticsearch([{"host": ip, "port": port}])
-                    for result in es.search(index=index)['hits']['hits']:
+                    cur.executemany(
+                            'INSERT OR REPLACE INTO ES_SAMPLES '
+                            '(DOCUMENT_ID, UUID, IP_ADDRESS, PORT, "INDEX", SAMPLE, UPDATED_DATE) '
+                            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            results)
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    print(f'Database locked. Retrying {tries} more times')
+                tries -= 1
+                time.sleep(1)
+        except ElasticsearchException as e:
+            print(f'Exception connecting to IP {ip}:{port}: {e}')
+                
 
-                        date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def sample(db_file:pathlib.Path, count: int):
+    ip_addresses = []
+    with sqlite3.connect(str(db_file)) as conn:
+        ip_addresses = conn.execute('SELECT UUID, IP_ADDRESS, PORT, "INDEX" FROM '
+                                    'ES_INDEXES WHERE DOCS_COUNT > 0 ORDER BY IP_ADDRESS, PORT').fetchall()
+        samples = process_map(_sample_parallel,
+            [(*data, db_file, count) for data in ip_addresses], max_workers=4)
 
-                        cur.execute(
-                                'INSERT OR REPLACE INTO ES_SAMPLES '
-                                '(UUID, IP_ADDRESS, PORT, "INDEX", SAMPLE, UPDATED_DATE) '
-                                'VALUES (?, ?, ?, ?, ?, ?)',
-                                (uuid, ip, port, index, json.dumps(result, indent=2), date))
-                        # commit about once per host
-                        if last_ip is not None and last_ip != ip:
-                            conn.commit()
-                        last_ip = ip
-                except ElasticsearchException as e:
-                    print(f'Exception connecting to IP {ip}:{port}: {e}')
-            print(']')
-        finally:
-            conn.commit()
-            cur.close()
 
+def dump_samples(db_file: pathlib.Path):
+    with sqlite3.connect(str(db_file)) as conn:
+        cur = conn.cursor()
+        samples = cur.execute('SELECT "INDEX", IP_ADDRESS, PORT, '
+                                    'SAMPLE FROM ES_SAMPLES'
+                                    ).fetchall()
+        print('[', end='')
+        first = True
+        for index, ip, port, sample in samples:
+            data = {
+                'host': ip,
+                'port': port,
+                'index': index,
+                'data': json.loads(sample)
+            }
+            if not first:
+                print(',')
+            else:
+                first = False
+            print(json.dumps(data, indent=2), end='')
+        print(']')
+    return
 
 
 def create_database(db_file: pathlib.Path):
@@ -190,6 +203,11 @@ def create_database(db_file: pathlib.Path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     subp = parser.add_subparsers(dest='subparser_name')
+
+    create_p = subp.add_parser('create', help='Create an empty sqlite database for storing results')
+    create_p.add_argument('database', type=pathlib.Path, default=pathlib.Path('data.db'),
+                        nargs='?', help='Database file')
+
     search_p = subp.add_parser('search', help='Search Shodan.io for Elasticsearch databases matching a keyword.')
     search_p.add_argument('--database', type=pathlib.Path, default=pathlib.Path('data.db'),
                         help='Database file')
@@ -206,12 +224,10 @@ if __name__ == '__main__':
                         help='Database file')
     sample_p.add_argument('--count', type=int, default=10,
                         help='Number of documents to sample per-index.')
-    sample_p.add_argument('--dump', action='store_true', default=False,
-                        help='Dump the results to stdout as a json file')
 
-    create_p = subp.add_parser('create', help='Create an empty sqlite database for storing results')
-    create_p.add_argument('database', type=pathlib.Path, default=pathlib.Path('data.db'),
-                        nargs='?', help='Database file')
+    dump_p = subp.add_parser('dump', help='Dump collected samples as one JSON object')
+    dump_p.add_argument('--database', type=pathlib.Path, default=pathlib.Path('data.db'),
+                        help='Database file')
 
     args = parser.parse_args()
     if args.subparser_name == 'create':
@@ -226,8 +242,10 @@ if __name__ == '__main__':
         sys.exit(1)
 
     if args.subparser_name == 'search':
-        search(args.database, args.keyword, args.api_key or ELASTIC_API_KEY)
+        search(args.database, args.keyword, args.api_key or SHODAN_API_KEY)
     elif args.subparser_name == 'scrape':
         scrape(args.database)
     elif args.subparser_name == 'sample':
-        sample(args.database, args.dump)
+        sample(args.database, args.count)
+    elif args.subparser_name == 'dump':
+        dump_samples(args.database)

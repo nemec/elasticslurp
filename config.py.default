@@ -1,1 +1,6 @@
-ELASTIC_API_KEY = ""
+SHODAN_API_KEY = ""
+INDEX_EXCLUSION_LIST_REGEXES = [
+    r'^\.kibana',
+    r'^nightlionsecurity\.com$',
+    r'^elasticsearch_metrics-'
+]
